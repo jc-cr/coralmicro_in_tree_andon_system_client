@@ -7,12 +7,21 @@ import time
 import requests
 import threading
 import base64
-import numpy as np
+
 import logging
 import argparse
 import os
 from datetime import datetime
 from enum import Enum
+import sys
+
+from PIL import Image, ImageTk
+import cv2
+import numpy as np
+
+import tkinter as tk
+from tkinter import ttk
+
 
 class SystemState(Enum):
     UNINITIALIZED = 0
@@ -24,7 +33,10 @@ class SystemState(Enum):
     HOST_STOPPED_STATE = 6
 
 class HeartbeatPublisher:
-    def __init__(self, ip="10.10.10.1", heartbeat_interval=1.0):
+    def __init__(self, ip="10.10.10.1", heartbeat_interval=1.0, debug=False):
+        # Enable debug features
+        self.debug = debug
+
         self.ip = ip
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_thread = None
@@ -103,8 +115,13 @@ class HeartbeatPublisher:
 
 
 class LoggingDataSubscriber:
-    def __init__(self, ip="10.10.10.1", poll_interval=0.1):
+    def __init__(self, ip="10.10.10.1", poll_interval=0.1, debug=False):
+        
+        # Enable debug features
+        self.debug = debug
+
         self.ip = ip
+
         self.poll_interval = poll_interval
         self.poll_thread = None
         self.stop_flag = False
@@ -123,13 +140,14 @@ class LoggingDataSubscriber:
         self.detection_counts = []
         
         # Create data directory
-        self.data_dir = os.path.join("logs", datetime.now().strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(self.data_dir, exist_ok=True)
-        
-        # Setup CSV log file
-        self.csv_path = os.path.join(self.data_dir, "detection_log.csv")
-        with open(self.csv_path, 'w') as f:
-            f.write("timestamp,system_state,detection_count,inference_time,depth_estimation_time\n")
+        if self.debug:
+            self.data_dir = os.path.join("logs", datetime.now().strftime("%Y%m%d_%H%M%S"))
+            os.makedirs(self.data_dir, exist_ok=True)
+            
+            # Setup CSV log file
+            self.csv_path = os.path.join(self.data_dir, "detection_log.csv")
+            with open(self.csv_path, 'w') as f:
+                f.write("timestamp,system_state,detection_count,inference_time,depth_estimation_time\n")
 
     def start_polling(self):
         """Start polling for logging data"""
@@ -160,13 +178,6 @@ class LoggingDataSubscriber:
                 if data:
                     self.process_logging_data(data)
                     self.received_count += 1
-                    
-                    # Log every 10 messages
-                    if self.received_count % 10 == 0:
-                        self.logger.info(f"Received {self.received_count} log messages, " +
-                                         f"current state: {self.last_system_state}, " +
-                                         f"detections: {self.last_detection_data['count'] if self.last_detection_data else 0}")
-                        
                 time.sleep(self.poll_interval)
                     
             except Exception as e:
@@ -224,7 +235,7 @@ class LoggingDataSubscriber:
             # Parse basic metadata
             timestamp = data.get('timestamp', 0)
             system_state_int = data.get('system_state', 0)
-            system_state = SystemState(system_state_int) if 0 <= system_state_int <= 6 else "UNKNOWN"
+            system_state = SystemState(system_state_int) if 0 <= system_state_int <= len(SystemState) else "UNKNOWN"
             detection_count = data.get('detection_count', 0)
             inference_time = data.get('inference_time', 0)
             depth_estimation_time = data.get('depth_estimation_time', 0)
@@ -233,9 +244,10 @@ class LoggingDataSubscriber:
             self.last_timestamp = timestamp
             self.last_system_state = system_state
             
-            # Save to CSV log
-            with open(self.csv_path, 'a') as f:
-                f.write(f"{timestamp},{system_state_int},{detection_count},{inference_time},{depth_estimation_time}\n")
+            if self.debug:
+                # Save to CSV log
+                with open(self.csv_path, 'a') as f:
+                    f.write(f"{timestamp},{system_state_int},{detection_count},{inference_time},{depth_estimation_time}\n")
             
             # Process detection data if available
             if 'detections' in data and detection_count > 0:
@@ -254,7 +266,7 @@ class LoggingDataSubscriber:
                     self.last_depth_data = depth_data
                 
                 # Save detection data to file when people are detected
-                if detection_count > 0:
+                if self.debug and detection_count > 0:
                     self._save_detection_data(timestamp, detection_data, depth_data)
             
             # Process camera image if available
@@ -273,9 +285,10 @@ class LoggingDataSubscriber:
                         'data': image_bytes
                     }
                     
-                    # Save images when detections are present
-                    if detection_count > 0:
-                        self._save_image(timestamp, width, height, image_bytes)
+                    if self.debug:
+                        if detection_count > 0:
+                            # Save image if detections are present
+                            cv2.imwrite(os.path.join(self.data_dir, f"image_{timestamp}.jpg"), np.frombuffer(image_bytes, dtype=np.uint8).reshape((height, width, 3)))
                         
                 except Exception as img_err:
                     self.logger.error(f"Error processing image data: {img_err}")
@@ -452,7 +465,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Andon System Logging Client')
     parser.add_argument('--ip', type=str, default='10.10.10.1', help='Device IP address')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--no-heartbeat', action='store_true', help='Disable heartbeat')
+    parser.add_argument('--headless', action='store_true', help='Run in headless mode. No GUI just data streaming')
+
     return parser.parse_args()
 
 
@@ -464,27 +478,17 @@ def main():
     logger.info(f"Starting Andon System Logging Client - connecting to {args.ip}")
     
     # Create instances
-    heartbeat = HeartbeatPublisher(ip=args.ip)
-    logging_subscriber = LoggingDataSubscriber(ip=args.ip)
+    heartbeat = HeartbeatPublisher(ip=args.ip, debug=args.debug)
+    logging_subscriber = LoggingDataSubscriber(ip=args.ip, poll_interval=0.1, debug=args.debug)
     
     try:
-        # Start heartbeat if not disabled
-        if not args.no_heartbeat:
-            heartbeat.start_heartbeat()
-        
+
+        heartbeat.start_heartbeat()
         # Start logging data subscriber
         logging_subscriber.start_polling()
         
-        # Main loop to display status
-        while True:
-            try:
-                time.sleep(10)
-                status = logging_subscriber.get_status_summary()
-                logger.info(f"Status: Received {status['received_count']} messages, " +
-                           f"State: {status['current_state']}, " +
-                           f"Avg detections: {status['avg_detections']:.2f}")
-            except KeyboardInterrupt:
-                break
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
     
     except Exception as e:
         logger.error(f"Error in main loop: {e}")
@@ -492,8 +496,7 @@ def main():
     finally:
         # Cleanup
         logger.info("Shutting down...")
-        if not args.no_heartbeat:
-            heartbeat.stop_heartbeat()
+        heartbeat.stop_heartbeat()
         logging_subscriber.stop_polling()
         logger.info("Client stopped")
 
