@@ -1,0 +1,20 @@
+{
+  "timestamp": 8117296,
+  "system_state": "SystemState.WARNING",
+  "detection_count": 1,
+  "detections": [
+    {
+      "id": 0,
+      "score": 0.7734375,
+      "bbox": {
+        "ymin": 11.30506420135498,
+        "xmin": 3.2453298568725586,
+        "ymax": 300.8691101074219,
+        "xmax": 296.7546691894531
+      }
+    }
+  ],
+  "depths": [
+    4027.71435546875
+  ]
+}

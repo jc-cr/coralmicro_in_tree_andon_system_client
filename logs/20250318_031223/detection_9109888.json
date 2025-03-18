@@ -1,0 +1,20 @@
+{
+  "timestamp": 9109888,
+  "system_state": "SystemState.SCANNING",
+  "detection_count": 1,
+  "detections": [
+    {
+      "id": 0,
+      "score": 0.55859375,
+      "bbox": {
+        "ymin": 37.52468490600586,
+        "xmin": 4.44822883605957,
+        "ymax": 294.6557312011719,
+        "xmax": 170.38592529296875
+      }
+    }
+  ],
+  "depths": [
+    4027.71435546875
+  ]
+}
