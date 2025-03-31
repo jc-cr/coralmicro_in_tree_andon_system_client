@@ -1,33 +1,17 @@
-#!/usr/bin/env python3
-import tkinter as tk
-from tkinter import ttk
 import logging
 import os
 import time
 import threading
 import json
 import base64
-import argparse
-import sys
 import requests
 from datetime import datetime
-from enum import Enum
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 import cv2
 from threading import Lock
 
-class SystemState(Enum):
-    UNINITIALIZED = 0
-    HOST_READING = 1
-    SCANNING = 2
-    WARNING = 3
-    STOPPED = 4
-    HOST_ACTIVE_STATE = 5
-    HOST_STOPPED_STATE = 6
-
-
-
+from enums import SystemState, HostState
 
 class HeartbeatPublisher:
     def __init__(self, ip="10.10.10.1", heartbeat_interval=1.0, debug=False):
@@ -77,15 +61,15 @@ class HeartbeatPublisher:
             time.sleep(self.heartbeat_interval)
     
     def send_heartbeat(self):
-        """Send heartbeat to device"""
+        """Send heartbeat to device - just indicates host computer is connected"""
         try:
-            # Standard JSON-RPC 2.0 format
+            # Use the parameter name 'connected' to match the microcontroller code
             payload = {
                 'id': 1,
                 'jsonrpc': '2.0',
-                'method': 'rx_from_host',
+                'method': 'host_heartbeat',
                 'params': {
-                    'host_state': 1
+                    'connected': True
                 }
             }
             
@@ -107,6 +91,79 @@ class HeartbeatPublisher:
             return False
         except Exception as e:
             self.logger.error(f"Unexpected error in heartbeat: {e}")
+            return False
+
+
+class HostStatePublisher:
+    """Handles sending PackML state updates from the host computer to the device"""
+    def __init__(self, ip="10.10.10.1", debug=False):
+        self.ip = ip
+        self.debug = debug
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.current_state = HostState.IDLE
+    
+    def set_host_state(self, state):
+        """
+        Set host state on the device
+        
+        Args:
+            state: HostState enum value or integer representing PackML state
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not isinstance(state, HostState):
+            try:
+                state = HostState(state)
+            except (ValueError, TypeError):
+                self.logger.error(f"Invalid host state: {state}")
+                return False
+        
+        self.current_state = state
+        return self.send_host_state()
+    
+    def send_host_state(self):
+        """Send current host state to device"""
+        try:
+            # Send the integer value of the PackML state to the microcontroller
+            # Ensure we're sending a number, not a string, and format it as mjson_get_number() expects
+            payload = {
+                'id': 1,
+                'jsonrpc': '2.0',
+                'method': 'rx_host_state',
+                'params': {
+                    'host_state': int(self.current_state.value)  # Ensure it's an integer
+                }
+            }
+            
+            if self.debug:
+                self.logger.debug(f"Sending host state: {self.current_state.name} (value: {int(self.current_state.value)})")
+                self.logger.debug(f"Payload: {payload}")
+            
+            response = requests.post(
+                f'http://{self.ip}/jsonrpc',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=1.0
+            )
+            
+            if response.status_code != 200:
+                self.logger.warning(f"HTTP error setting host state: {response.status_code}")
+                return False
+                
+            result = response.json()
+            if 'error' in result:
+                self.logger.warning(f"RPC error setting host state: {result['error']}")
+                return False
+            
+            self.logger.info(f"Successfully set host state to {self.current_state.name}")
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Network error setting host state: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error setting host state: {e}")
             return False
 
 
@@ -225,12 +282,12 @@ class DataSubscriber:
         """Process received logging data"""
         try:
             # Parse basic metadata
-            timestamp = data.get('timestamp', 0)
+            timestamp = data.get('log_timestamp_ms', 0)
             system_state_int = data.get('system_state', 0)
             system_state = SystemState(system_state_int) if 0 <= system_state_int < len(SystemState) else "UNKNOWN"
             detection_count = data.get('detection_count', 0)
-            inference_time = data.get('inference_time', 0)
-            depth_estimation_time = data.get('depth_estimation_time', 0)
+            inference_time = data.get('inference_time_ms', 0)
+            depth_estimation_time = data.get('depth_estimation_time_ms', 0)
             
             # Thread-safe update of state tracking
             with self.data_lock:
@@ -281,7 +338,7 @@ class DataSubscriber:
                             'width': width,
                             'height': height,
                             'format': data.get('cam_format', 0),
-                            'timestamp': data.get('cam_timestamp', 0),
+                            'timestamp': data.get('image_capture_timestamp_ms', 0),
                             'img_bytes': image_bytes,
                             'img_array': img_data.reshape((height, width, 3)) if len(img_data) == expected_size else None
                         }
@@ -536,227 +593,3 @@ class DataSubscriber:
                 'detection_count': self.last_detection_data.get('count', 0) if self.last_detection_data else 0
             }
 
-
-class Visualizer:
-    def __init__(self, data_subscriber):
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.data_subscriber = data_subscriber
-        
-        # Setup main window
-        self.root = tk.Tk()
-        self.root.title("Data Stream Visualizer")
-        self.root.geometry("800x700")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        
-        self.create_gui()
-    
-    def create_gui(self):
-        """Create GUI components"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Info header
-        info_frame = ttk.LabelFrame(main_frame, text="Stream Information")
-        info_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Info grid
-        info_grid = ttk.Frame(info_frame)
-        info_grid.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Timestamp info
-        ttk.Label(info_grid, text="Timestamp:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.timestamp_var = tk.StringVar(value="--")
-        ttk.Label(info_grid, textvariable=self.timestamp_var).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Detection time info
-        ttk.Label(info_grid, text="Detection Time:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.detection_time_var = tk.StringVar(value="--")
-        ttk.Label(info_grid, textvariable=self.detection_time_var).grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Depth estimation time
-        ttk.Label(info_grid, text="Depth Time:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.depth_time_var = tk.StringVar(value="--")
-        ttk.Label(info_grid, textvariable=self.depth_time_var).grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # System state
-        ttk.Label(info_grid, text="System State:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
-        self.system_state_var = tk.StringVar(value="--")
-        ttk.Label(info_grid, textvariable=self.system_state_var).grid(row=0, column=3, sticky=tk.W, padx=5, pady=2)
-        
-        # Detection count
-        ttk.Label(info_grid, text="Detections:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
-        self.detection_count_var = tk.StringVar(value="--")
-        ttk.Label(info_grid, textvariable=self.detection_count_var).grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
-        
-        # Recording status
-        ttk.Label(info_grid, text="Recording:").grid(row=2, column=2, sticky=tk.W, padx=5, pady=2)
-        self.recording_var = tk.StringVar(value="OFF")
-        self.recording_label = ttk.Label(info_grid, textvariable=self.recording_var)
-        self.recording_label.grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
-        
-        # Image display
-        self.image_frame = ttk.LabelFrame(main_frame, text="RGB Stream")
-        self.image_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.image_label = ttk.Label(self.image_frame)
-        self.image_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Control buttons
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.record_button = ttk.Button(control_frame, text="Record Data", command=self.toggle_recording)
-        self.record_button.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        ttk.Button(control_frame, text="Exit", command=self.on_close).pack(side=tk.RIGHT, padx=5, pady=5)
-    
-    def update_display(self):
-        """Update display with latest data"""
-        # Update info variables
-        status = self.data_subscriber.get_status_info()
-        
-        if status['timestamp']:
-            self.timestamp_var.set(f"{status['timestamp']}")
-        
-        if status['inference_time'] is not None:
-            self.detection_time_var.set(f"{status['inference_time']:.2f} ms")
-        
-        if status['depth_estimation_time'] is not None:
-            self.depth_time_var.set(f"{status['depth_estimation_time']:.2f} ms")
-        
-        if status['system_state']:
-            self.system_state_var.set(f"{status['system_state']}")
-        
-        self.detection_count_var.set(f"{status['detection_count']}")
-        
-        # Update image - this needs to be stored to prevent garbage collection
-        frame = self.data_subscriber.get_current_frame()
-        if frame is not None:
-            # Convert to PhotoImage and update display
-            self.photo = ImageTk.PhotoImage(frame)  # Store as instance variable
-            self.image_label.configure(image=self.photo)
-        
-        # Schedule next update
-        self.root.after(33, self.update_display)  # ~30 FPS
-    
-    def toggle_recording(self):
-        """Toggle recording state"""
-        is_recording = self.data_subscriber.toggle_recording()
-        
-        if is_recording:
-            self.recording_var.set("ON")
-            self.recording_label.configure(foreground="red")
-            self.record_button.configure(text="Stop Recording")
-        else:
-            self.recording_var.set("OFF")
-            self.recording_label.configure(foreground="black")
-            self.record_button.configure(text="Record Data")
-    
-    def on_close(self):
-        """Handle window close event"""
-        self.logger.info("Shutting down...")
-        self.root.destroy()
-    
-    def run(self):
-        """Start visualizer"""
-        # Start data services
-        self.data_subscriber.start_polling()
-        
-        # Start display updates
-        self.root.after(100, self.update_display)
-        
-        # Start main loop
-        self.root.mainloop()
-
-
-def setup_logging(enable_debug=False):
-    """Setup logging configuration"""
-    # Create logs directory
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Configure logging
-    log_level = logging.DEBUG if enable_debug else logging.INFO
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    
-    # Setup handlers
-    handlers = [
-        logging.StreamHandler(sys.stdout)
-    ]
-    
-    # Add file handler if debug is enabled
-    if enable_debug:
-        log_file = os.path.join(log_dir, f"visualizer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-        file_handler = logging.FileHandler(log_file)
-        handlers.append(file_handler)
-    
-    # Configure logging
-    logging.basicConfig(
-        level=log_level,
-        format=log_format,
-        handlers=handlers
-    )
-    
-    return logging.getLogger("main")
-
-
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Data Stream Visualizer')
-    parser.add_argument('--ip', type=str, default='10.10.10.1', help='Device IP address')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--headless', action='store_true', help='Run in headless mode (no GUI)')
-    
-    return parser.parse_args()
-
-
-def main():
-    """Main entry point"""
-    # Parse arguments
-    args = parse_args()
-    
-    # Setup logging
-    logger = setup_logging(args.debug)
-    logger.info(f"Starting Data Stream Visualizer - connecting to {args.ip}")
-    
-    try:
-        # Create components
-        data_subscriber = DataSubscriber(ip=args.ip, debug=args.debug)
-        heartbeat_publisher = HeartbeatPublisher(ip=args.ip, debug=args.debug)
-
-        # Start the heartbeat publisher regardless of mode
-        heartbeat_publisher.start_heartbeat()
-
-        if not args.headless:
-            # Start GUI visualizer
-            visualizer = Visualizer(data_subscriber)
-            visualizer.run()
-        else:
-            # Run in headless mode (no GUI)
-            logger.info("Starting in headless mode")
-            data_subscriber.start_polling()
-            
-            # Keep the main thread alive
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received, shutting down")
-                heartbeat_publisher.stop_heartbeat()
-                data_subscriber.stop_polling()
-
-            finally:
-                heartbeat_publisher.stop_heartbeat()
-                data_subscriber.stop_polling()
-                logger.info("Stopped all services")
-        
-    except Exception as e:
-        logger.error(f"Application error: {e}", exc_info=True)
-        return 1
-    
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
